@@ -1,3 +1,5 @@
+extern int printf(char* fmt, ...);
+
 int fib(int n) {
   if (n < 2) {
     return n;
@@ -14,4 +16,9 @@ int fib(int n) {
   return b;
 }
 
-int main() { return fib(10); }
+int main() { 
+	int n = 10;
+	int x = fib(n); 
+	printf("fib(%d) = %d\n",n, x); 
+	return 0; 
+}

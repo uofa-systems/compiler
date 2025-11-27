@@ -1,310 +1,292 @@
-use crate::ast::{BinOp, Expr, Function, Program, Stmt, UnOp};
-use crate::error::CompileError;
-use std::collections::HashMap;
+use crate::ir::{Instr, IrProgram, Op, Val};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
-/// Context for code generation for a single function.
-struct CodeGen<'a> {
-    ast: &'a Function,
-    var_map: HashMap<String, i32>,
-    stack_size: i32,
-    label_count: usize,
-}
+pub fn generate(program: &IrProgram) -> String {
+    let mut asm = String::new();
 
-impl<'a> CodeGen<'a> {
-    fn new(ast: &'a Function) -> Self {
-        CodeGen {
-            ast,
-            var_map: HashMap::new(),
-            stack_size: 0,
-            label_count: 0,
+    if !program.rodata.is_empty() {
+        writeln!(asm, ".section .rodata").unwrap();
+        for (label, content) in &program.rodata {
+            writeln!(asm, "{}:", label).unwrap();
+            writeln!(asm, "  .string \"{}\"", content).unwrap();
         }
     }
 
-    fn new_label(&mut self) -> String {
-        let count = self.label_count;
-        self.label_count += 1;
-        format!(".L{}", count)
+    if !program.globals.is_empty() {
+        writeln!(asm, "\n.section .data").unwrap();
+        for global in &program.globals {
+            writeln!(asm, ".globl {}", global).unwrap();
+            writeln!(asm, "{}:", global).unwrap();
+            let val = program.global_inits.get(global).unwrap_or(&0);
+            writeln!(asm, "  .quad {}", val).unwrap();
+        }
     }
 
-    fn analyze_stack(&mut self) {
-        let mut offset = 0;
-        // In RISC-V with our frame pointer setup, parameters passed in registers
-        // will be spilled to the stack. We assign them offsets relative to s0 (fp).
-        for param_name in self.ast.params.iter() {
+    writeln!(asm, "\n.text").unwrap();
+
+    for func in &program.functions {
+        writeln!(asm, "\n.globl {}", func.name).unwrap();
+        writeln!(asm, ".type {}, @function", func.name).unwrap();
+        writeln!(asm, "{}:", func.name).unwrap();
+
+        let mut map: HashMap<String, i32> = HashMap::new();
+        let mut temp_map: HashMap<usize, i32> = HashMap::new();
+        let mut offset: i32 = 16;
+
+        for p in &func.params {
+            if !map.contains_key(p) {
+                offset += 8;
+                map.insert(p.clone(), offset);
+            }
+        }
+
+        for instr in &func.instrs {
+            if let Instr::StackAlloc { name, size } = instr {
+                if !map.contains_key(name) {
+                    offset += *size as i32;
+                    map.insert(name.clone(), offset);
+                }
+            }
+        }
+
+        let mut temps_used: HashSet<usize> = HashSet::new();
+        let mut add_val = |v: &Val| {
+            if let Val::Temp(id) = v {
+                temps_used.insert(*id);
+            }
+        };
+        for instr in &func.instrs {
+            match instr {
+                Instr::Binary {
+                    dest, left, right, ..
+                } => {
+                    add_val(dest);
+                    add_val(left);
+                    add_val(right);
+                }
+                Instr::Copy { dest, src } => {
+                    add_val(dest);
+                    add_val(src);
+                }
+                Instr::Neg { dest, src } | Instr::Not { dest, src } => {
+                    add_val(dest);
+                    add_val(src);
+                }
+                Instr::AddrOf { dest, .. } => add_val(dest),
+                Instr::Load { dest, addr } | Instr::LoadByte { dest, addr } => {
+                    add_val(dest);
+                    add_val(addr);
+                }
+                Instr::Store { addr, src } | Instr::StoreByte { addr, src } => {
+                    add_val(addr);
+                    add_val(src);
+                }
+                Instr::Branch { cond, .. } => add_val(cond),
+                Instr::Return(rv) => {
+                    if let Some(v) = rv {
+                        add_val(v);
+                    }
+                }
+                Instr::Call { dest, args, .. } => {
+                    if let Some(d) = dest {
+                        add_val(d);
+                    }
+                    for a in args {
+                        add_val(a);
+                    }
+                }
+                Instr::Jump { .. } | Instr::Label(_) | Instr::StackAlloc { .. } => {}
+            }
+        }
+
+        let mut temp_ids: Vec<_> = temps_used.into_iter().collect();
+        temp_ids.sort_unstable();
+        for id in temp_ids {
             offset += 8;
-            self.var_map.insert(param_name.clone(), offset);
-        }
-        self.find_declarations_in_stmt(&self.ast.body, &mut offset);
-        self.stack_size = offset;
-    }
-
-    fn find_declarations_in_stmt(&mut self, stmt: &Stmt, offset: &mut i32) {
-        match stmt {
-            Stmt::Declare { name, .. } => {
-                *offset += 8;
-                self.var_map.insert(name.clone(), *offset);
-            }
-            Stmt::Block(stmts) => {
-                for s in stmts {
-                    self.find_declarations_in_stmt(s, offset);
-                }
-            }
-            Stmt::If {
-                then_branch,
-                else_branch,
-                ..
-            } => {
-                self.find_declarations_in_stmt(then_branch, offset);
-                if let Some(else_b) = else_branch {
-                    self.find_declarations_in_stmt(else_b, offset);
-                }
-            }
-            Stmt::While { body, .. } => {
-                self.find_declarations_in_stmt(body, offset);
-            }
-            _ => {}
-        }
-    }
-
-    // Helper to simulate x86 'push' on RISC-V
-    fn emit_push(&self, reg: &str) {
-        println!("  addi sp, sp, -8");
-        println!("  sd {}, 0(sp)", reg);
-    }
-
-    // Helper to simulate x86 'pop' on RISC-V
-    fn emit_pop(&self, reg: &str) {
-        println!("  ld {}, 0(sp)", reg);
-        println!("  addi sp, sp, 8");
-    }
-
-    fn generate_function(&mut self) -> Result<(), CompileError> {
-        self.analyze_stack();
-
-        // Function symbol
-        println!("\n.text");
-        println!(".globl {}", self.ast.name);
-        println!(".type {}, @function", self.ast.name);
-        println!("{}:", self.ast.name);
-
-        // -- Prologue --
-        // 1. Allocate space for Return Address (ra) and Old Frame Pointer (s0)
-        println!("  addi sp, sp, -16");
-        println!("  sd ra, 8(sp)");
-        println!("  sd s0, 0(sp)");
-        // 2. Set new Frame Pointer to the top of the stack frame
-        println!("  addi s0, sp, 16");
-
-        // 3. Allocate space for local variables (aligned to 16 bytes)
-        let aligned_stack_size = (self.stack_size + 15) & !15;
-        if aligned_stack_size > 0 {
-            println!("  sub sp, sp, {}", aligned_stack_size);
+            temp_map.insert(id, offset);
         }
 
-        // -- Parameters --
-        // RISC-V passes args in a0-a7. We spill them to the stack for simplicity.
-        // This compiler supports up to 6 args (a0-a5).
-        let arg_registers = ["a0", "a1", "a2", "a3", "a4", "a5"];
-        for (i, param_name) in self.ast.params.iter().enumerate() {
-            if i >= arg_registers.len() {
-                return Err("More than 6 parameters not supported".into());
+        let frame_size = (offset + 15) & !15;
+
+        writeln!(asm, "  addi sp, sp, -{}", frame_size).unwrap();
+        writeln!(asm, "  sd ra, {}(sp)", frame_size - 8).unwrap();
+        writeln!(asm, "  sd s0, {}(sp)", frame_size - 16).unwrap();
+        writeln!(asm, "  addi s0, sp, {}", frame_size).unwrap();
+
+        let arg_regs = ["a0", "a1", "a2", "a3", "a4", "a5"];
+        for (i, param) in func.params.iter().enumerate() {
+            if i < arg_regs.len() {
+                let off = *map.get(param).expect("internal: missing param slot");
+                writeln!(asm, "  sd {}, -{}(s0)", arg_regs[i], off).unwrap();
             }
-            let offset = *self.var_map.get(param_name).unwrap();
-            // Store argument register into local stack slot: -offset(s0)
-            println!("  sd {}, -{}(s0)", arg_registers[i], offset);
         }
 
-        // -- Body --
-        self.gen_stmt(&self.ast.body)?;
-
-        // -- Epilogue Label --
-        println!(".L.return.{}:", self.ast.name);
-
-        // Restore Stack Pointer (release locals)
-        // We calculate where sp should be: s0 - 16
-        println!("  addi sp, s0, -16");
-
-        // Restore RA and Old FP
-        println!("  ld ra, 8(sp)");
-        println!("  ld s0, 0(sp)");
-
-        // Pop the RA/FP slot
-        println!("  addi sp, sp, 16");
-
-        // Return
-        println!("  ret");
-
-        Ok(())
+        for instr in &func.instrs {
+            writeln!(asm, "  # {:?}", instr).unwrap();
+            match instr {
+                Instr::StackAlloc { .. } => {}
+                Instr::Label(l) => writeln!(asm, "{}:", l).unwrap(),
+                Instr::Jump { label } => writeln!(asm, "  j {}", label).unwrap(),
+                Instr::Branch {
+                    cond,
+                    true_label,
+                    false_label,
+                } => {
+                    load_val(&mut asm, cond, "t0", &map, &temp_map);
+                    writeln!(asm, "  bnez t0, {}", true_label).unwrap();
+                    writeln!(asm, "  j {}", false_label).unwrap();
+                }
+                Instr::Return(val) => {
+                    if let Some(v) = val {
+                        load_val(&mut asm, v, "a0", &map, &temp_map);
+                    }
+                    writeln!(asm, "  ld ra, {}(sp)", frame_size - 8).unwrap();
+                    writeln!(asm, "  ld s0, {}(sp)", frame_size - 16).unwrap();
+                    writeln!(asm, "  addi sp, sp, {}", frame_size).unwrap();
+                    writeln!(asm, "  ret").unwrap();
+                }
+                Instr::Copy { dest, src } => {
+                    load_val(&mut asm, src, "t0", &map, &temp_map);
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::Neg { dest, src } => {
+                    load_val(&mut asm, src, "t0", &map, &temp_map);
+                    writeln!(asm, "  neg t0, t0").unwrap();
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::Not { dest, src } => {
+                    load_val(&mut asm, src, "t0", &map, &temp_map);
+                    writeln!(asm, "  not t0, t0").unwrap();
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::Binary {
+                    dest,
+                    op,
+                    left,
+                    right,
+                } => {
+                    load_val(&mut asm, left, "t0", &map, &temp_map);
+                    load_val(&mut asm, right, "t1", &map, &temp_map);
+                    match op {
+                        Op::Add => writeln!(asm, "  add t0, t0, t1").unwrap(),
+                        Op::Sub => writeln!(asm, "  sub t0, t0, t1").unwrap(),
+                        Op::Mul => writeln!(asm, "  mul t0, t0, t1").unwrap(),
+                        Op::Div => writeln!(asm, "  div t0, t0, t1").unwrap(),
+                        Op::Eq => {
+                            writeln!(asm, "  sub t0, t0, t1").unwrap();
+                            writeln!(asm, "  seqz t0, t0").unwrap();
+                        }
+                        Op::Ne => {
+                            writeln!(asm, "  sub t0, t0, t1").unwrap();
+                            writeln!(asm, "  snez t0, t0").unwrap();
+                        }
+                        Op::Lt => writeln!(asm, "  slt t0, t0, t1").unwrap(),
+                        Op::Gt => writeln!(asm, "  slt t0, t1, t0").unwrap(),
+                        Op::BitAnd => writeln!(asm, "  and t0, t0, t1").unwrap(),
+                        Op::BitOr => writeln!(asm, "  or  t0, t0, t1").unwrap(),
+                        Op::BitXor => writeln!(asm, "  xor t0, t0, t1").unwrap(),
+                        Op::Shl => writeln!(asm, "  sll t0, t0, t1").unwrap(),
+                        Op::Shr => writeln!(asm, "  sra t0, t0, t1").unwrap(),
+                    }
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::Call { dest, func, args } => {
+                    let arg_regs = ["a0", "a1", "a2", "a3", "a4", "a5"];
+                    for (i, arg) in args.iter().enumerate() {
+                        if i < arg_regs.len() {
+                            load_val(&mut asm, arg, arg_regs[i], &map, &temp_map);
+                        } else {
+                            // TODO: Later support varargs beyond 6, push onto stack here
+                        }
+                    }
+                    writeln!(asm, "  call {}", func).unwrap();
+                    if let Some(d) = dest {
+                        store_val(&mut asm, d, "a0", &map, &temp_map);
+                    }
+                }
+                Instr::AddrOf { dest, src_var } => {
+                    if let Some(off) = map.get(src_var) {
+                        writeln!(asm, "  addi t0, s0, -{}", off).unwrap();
+                    } else {
+                        writeln!(asm, "  la t0, {}", src_var).unwrap();
+                    }
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::Load { dest, addr } => {
+                    load_val(&mut asm, addr, "t0", &map, &temp_map);
+                    writeln!(asm, "  ld t0, 0(t0)").unwrap();
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::Store { addr, src } => {
+                    load_val(&mut asm, src, "t0", &map, &temp_map);
+                    load_val(&mut asm, addr, "t1", &map, &temp_map);
+                    writeln!(asm, "  sd t0, 0(t1)").unwrap();
+                }
+                Instr::LoadByte { dest, addr } => {
+                    load_val(&mut asm, addr, "t0", &map, &temp_map);
+                    writeln!(asm, "  lb t0, 0(t0)").unwrap();
+                    store_val(&mut asm, dest, "t0", &map, &temp_map);
+                }
+                Instr::StoreByte { addr, src } => {
+                    load_val(&mut asm, src, "t0", &map, &temp_map);
+                    load_val(&mut asm, addr, "t1", &map, &temp_map);
+                    writeln!(asm, "  sb t0, 0(t1)").unwrap();
+                }
+            }
+        }
     }
+    asm
+}
 
-    fn gen_stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
-        match stmt {
-            Stmt::Return(expr) => {
-                // Result goes in a0
-                self.gen_expr(expr)?;
-                println!("  j .L.return.{}", self.ast.name);
-            }
-            Stmt::Block(stmts) => {
-                for s in stmts {
-                    self.gen_stmt(s)?;
-                }
-            }
-            Stmt::If {
-                condition,
-                then_branch,
-                else_branch,
-            } => {
-                let else_label = self.new_label();
-                let end_label = self.new_label();
-
-                self.gen_expr(condition)?; // Result in a0
-                // If a0 == 0, jump to else
-                println!("  beq a0, zero, {}", else_label);
-
-                self.gen_stmt(then_branch)?;
-                println!("  j {}", end_label);
-
-                println!("{}:", else_label);
-                if let Some(else_stmt) = else_branch {
-                    self.gen_stmt(else_stmt)?;
-                }
-                println!("{}:", end_label);
-            }
-            Stmt::While { condition, body } => {
-                let start_label = self.new_label();
-                let end_label = self.new_label();
-
-                println!("{}:", start_label);
-                self.gen_expr(condition)?; // Result in a0
-
-                // If a0 == 0, jump to end
-                println!("  beq a0, zero, {}", end_label);
-
-                self.gen_stmt(body)?;
-                println!("  j {}", start_label);
-                println!("{}:", end_label);
-            }
-            Stmt::Declare { name, initializer } => {
-                if let Some(expr) = initializer {
-                    let offset = *self.var_map.get(name).unwrap();
-                    self.gen_expr(expr)?;
-                    // Store a0 into stack variable
-                    println!("  sd a0, -{}(s0)", offset);
-                }
-            }
-            Stmt::Expr(expr) => {
-                self.gen_expr(expr)?;
-            }
+fn load_val(
+    asm: &mut String,
+    val: &Val,
+    reg: &str,
+    map: &HashMap<String, i32>,
+    temp_map: &HashMap<usize, i32>,
+) {
+    match val {
+        Val::Const(c) => writeln!(asm, "  li {}, {}", reg, c).unwrap(),
+        Val::Var(name) => {
+            let off = map.get(name).unwrap_or_else(|| {
+                panic!("codegen: missing stack slot for local/param '{}'", name)
+            });
+            writeln!(asm, "  ld {}, -{}(s0)", reg, off).unwrap();
         }
-        Ok(())
-    }
-
-    /// Recursively generates code for an expression. Leaves result in a0.
-    fn gen_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
-        match expr {
-            Expr::Number { value, .. } => {
-                println!("  li a0, {}", value);
-            }
-            Expr::Variable { name, .. } => {
-                let offset = *self
-                    .var_map
-                    .get(name)
-                    .ok_or_else(|| CompileError::new(format!("Undefined variable: {}", name)))?;
-                println!("  ld a0, -{}(s0)", offset);
-            }
-            Expr::Assign { name, value, .. } => {
-                let offset = *self.var_map.get(name).ok_or_else(|| {
-                    CompileError::new(format!("Undefined variable in assignment: {}", name))
-                })?;
-                self.gen_expr(value)?;
-                println!("  sd a0, -{}(s0)", offset);
-            }
-            Expr::Unary { op, expr, .. } => {
-                self.gen_expr(expr)?;
-                match op {
-                    UnOp::Neg => println!("  neg a0, a0"),
-                }
-            }
-            Expr::Binary {
-                op, left, right, ..
-            } => {
-                // 1. Evaluate Right, result in a0
-                self.gen_expr(right)?;
-                // 2. Push Right to stack
-                self.emit_push("a0");
-                // 3. Evaluate Left, result in a0
-                self.gen_expr(left)?;
-                // 4. Pop Right into t1
-                self.emit_pop("t1");
-
-                // Left is in a0, Right is in t1
-                match op {
-                    BinOp::Add => println!("  add a0, a0, t1"),
-                    BinOp::Sub => println!("  sub a0, a0, t1"),
-                    BinOp::Mul => println!("  mul a0, a0, t1"),
-                    BinOp::Div => println!("  div a0, a0, t1"), // Integer division
-
-                    // Comparisons return 1 or 0 in a0
-                    BinOp::Eq => {
-                        println!("  sub a0, a0, t1"); // a0 = left - right
-                        println!("  seqz a0, a0"); // a0 = (a0 == 0) ? 1 : 0
-                    }
-                    BinOp::NotEq => {
-                        println!("  sub a0, a0, t1"); // a0 = left - right
-                        println!("  snez a0, a0"); // a0 = (a0 != 0) ? 1 : 0
-                    }
-                    BinOp::Lt => {
-                        // slt rd, rs1, rs2 -> set rd=1 if rs1 < rs2
-                        println!("  slt a0, a0, t1");
-                    }
-                    BinOp::LtEq => {
-                        // left <= right is !(right < left) -> slt t0, right, left; xori a0, t0, 1
-                        println!("  slt a0, t1, a0"); // Check right < left
-                        println!("  xori a0, a0, 1"); // Negate result
-                    }
-                    BinOp::Gt => {
-                        // left > right is right < left
-                        println!("  slt a0, t1, a0");
-                    }
-                    BinOp::GtEq => {
-                        // left >= right is !(left < right)
-                        println!("  slt a0, a0, t1"); // Check left < right
-                        println!("  xori a0, a0, 1"); // Negate
-                    }
-                }
-            }
-            Expr::Call { name, args, .. } => {
-                if args.len() > 6 {
-                    return Err("More than 6 arguments not supported".into());
-                }
-
-                // Evaluate arguments and push them to stack
-                for arg in args.iter() {
-                    self.gen_expr(arg)?;
-                    self.emit_push("a0");
-                }
-
-                // Pop arguments into argument registers in reverse order
-                let arg_registers = ["a0", "a1", "a2", "a3", "a4", "a5"];
-                for i in (0..args.len()).rev() {
-                    self.emit_pop(arg_registers[i]);
-                }
-
-                println!("  call {}", name);
-            }
+        Val::Temp(id) => {
+            let off = temp_map
+                .get(id)
+                .unwrap_or_else(|| panic!("codegen: missing temp slot for t{}", id));
+            writeln!(asm, "  ld {}, -{}(s0)", reg, off).unwrap();
         }
-        Ok(())
+        Val::StringLabel(lbl) => writeln!(asm, "  la {}, {}", reg, lbl).unwrap(),
+        Val::Global(name) => writeln!(asm, "  la {}, {}", reg, name).unwrap(),
     }
 }
 
-pub fn generate(ast: &Program) -> Result<(), CompileError> {
-    // Basic RISC-V Header
-
-    // Process functions
-    for function in &ast.functions {
-        let mut generator = CodeGen::new(function);
-        generator.generate_function()?;
+fn store_val(
+    asm: &mut String,
+    val: &Val,
+    reg: &str,
+    map: &HashMap<String, i32>,
+    temp_map: &HashMap<usize, i32>,
+) {
+    match val {
+        Val::Var(name) => {
+            let off = map.get(name).unwrap_or_else(|| {
+                panic!("codegen: missing stack slot for local/param '{}'", name)
+            });
+            writeln!(asm, "  sd {}, -{}(s0)", reg, off).unwrap();
+        }
+        Val::Temp(id) => {
+            let off = temp_map
+                .get(id)
+                .unwrap_or_else(|| panic!("codegen: missing temp slot for t{}", id));
+            writeln!(asm, "  sd {}, -{}(s0)", reg, off).unwrap();
+        }
+        Val::Const(_) | Val::StringLabel(_) | Val::Global(_) => {
+            panic!("codegen: cannot store to constant/label/global_direct")
+        }
     }
-
-    Ok(())
 }
